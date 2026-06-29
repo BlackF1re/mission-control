@@ -37,6 +37,10 @@ const PANEL_ACTION_TIMEOUT_MS = Object.freeze({
 });
 const CONNECTIONS_REFRESH_INTERVAL_MS = 2000;
 const PANEL_STATE_BOOTSTRAP_WAIT_MS = 1500;
+const GRAPH_HISTORY_RETENTION_MS = 65 * 60 * 1000;
+const GRAPH_SAMPLE_MIN_SPACING_MS = 900;
+const GRAPH_FALLBACK_SPACING_MS = 2000;
+const NODE_TREND_FALLBACK_SPACING_MS = 60 * 1000;
 const LIVE_SNAPSHOT_STORAGE_KEY = "mission-control.live.snapshot.v1";
 const LEGACY_LIVE_SNAPSHOT_STORAGE_KEY = "nikki-panel.live.snapshot.v1";
 const LIVE_SNAPSHOT_WINDOW_NAME_PREFIX = "__mission_control_snapshot__:";
@@ -204,15 +208,132 @@ function lastDelay(history) {
 }
 
 function delayTrend(history, fallbackDelay) {
-  const delays = (Array.isArray(history) ? history : [])
-    .map((item) => Number(item?.delay ?? item?.Delay ?? item))
-    .filter((value) => Number.isFinite(value) && value > 0)
-    .slice(-18)
-    .map((value) => Math.round(value));
+  const delays = normalizeTimedSeries(Array.isArray(history) ? history : [], {
+    fallbackSpacingMs: NODE_TREND_FALLBACK_SPACING_MS,
+    roundDigits: 0,
+  }).slice(-18);
   if (delays.length) {
     return delays;
   }
-  return Array.from({ length: 18 }, () => fallbackDelay || 0);
+  return buildFallbackSeries(18, fallbackDelay || 0, NODE_TREND_FALLBACK_SPACING_MS, 0);
+}
+
+function roundToDigits(value, digits = 0) {
+  const precision = 10 ** Math.max(0, digits);
+  return Math.round(Number(value || 0) * precision) / precision;
+}
+
+function parseSampleTimestamp(value) {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+    return value;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return 0;
+}
+
+function normalizeTimedSample(sample, roundDigits = 0) {
+  const rawValue =
+    sample && typeof sample === "object"
+      ? sample.value ?? sample.delay ?? sample.Delay ?? sample.latency ?? sample.y
+      : sample;
+  const value = Number(rawValue);
+  if (!Number.isFinite(value) || value < 0) {
+    return null;
+  }
+  const rawAt =
+    sample && typeof sample === "object"
+      ? sample.at ?? sample.time ?? sample.Time ?? sample.timestamp ?? sample.ts
+      : null;
+  return {
+    value: roundToDigits(value, roundDigits),
+    at: parseSampleTimestamp(rawAt),
+  };
+}
+
+function pruneTimedSeries(series, retentionMs = GRAPH_HISTORY_RETENTION_MS) {
+  const items = Array.isArray(series) ? series : [];
+  if (!items.length) {
+    return [];
+  }
+  const latestAt = items.reduce((max, item) => (item.at > max ? item.at : max), 0) || Date.now();
+  const cutoff = latestAt - Math.max(60 * 1000, Number(retentionMs) || GRAPH_HISTORY_RETENTION_MS);
+  return items.filter((item, index) => index === items.length - 1 || item.at >= cutoff);
+}
+
+function normalizeTimedSeries(series, options = {}) {
+  const items = (Array.isArray(series) ? series : [])
+    .map((item) => normalizeTimedSample(item, options.roundDigits ?? 0))
+    .filter(Boolean);
+  if (!items.length) {
+    return [];
+  }
+
+  const fallbackSpacingMs = Math.max(1000, Number(options.fallbackSpacingMs) || GRAPH_FALLBACK_SPACING_MS);
+  const firstKnownIndex = items.findIndex((item) => item.at > 0);
+  if (firstKnownIndex === -1) {
+    const endAt = Date.now();
+    const startAt = endAt - Math.max(0, (items.length - 1) * fallbackSpacingMs);
+    return pruneTimedSeries(
+      items.map((item, index) => ({
+        value: item.value,
+        at: startAt + index * fallbackSpacingMs,
+      })),
+      options.retentionMs,
+    );
+  }
+
+  for (let index = firstKnownIndex - 1; index >= 0; index -= 1) {
+    items[index].at = items[index + 1].at - fallbackSpacingMs;
+  }
+  for (let index = firstKnownIndex + 1; index < items.length; index += 1) {
+    if (items[index].at <= 0) {
+      items[index].at = items[index - 1].at + fallbackSpacingMs;
+    }
+  }
+
+  return pruneTimedSeries(items, options.retentionMs);
+}
+
+function buildFallbackSeries(length, fallbackValue, spacingMs, roundDigits = 0) {
+  const size = Math.max(1, Number(length) || 1);
+  const stepMs = Math.max(1000, Number(spacingMs) || GRAPH_FALLBACK_SPACING_MS);
+  const endAt = Date.now();
+  const startAt = endAt - Math.max(0, (size - 1) * stepMs);
+  return Array.from({ length: size }, (_, index) => ({
+    value: roundToDigits(fallbackValue || 0, roundDigits),
+    at: startAt + index * stepMs,
+  }));
+}
+
+function appendTimedValue(series, value, options = {}) {
+  const numericValue = Number(value);
+  if (!Number.isFinite(numericValue) || numericValue < 0) {
+    return Array.isArray(series) ? series.slice() : [];
+  }
+
+  const now = Number(options.at) > 0 ? Number(options.at) : Date.now();
+  const items = normalizeTimedSeries(series, {
+    fallbackSpacingMs: options.fallbackSpacingMs,
+    retentionMs: options.retentionMs,
+    roundDigits: options.roundDigits,
+  });
+  const roundedValue = roundToDigits(numericValue, options.roundDigits ?? 0);
+  const minSpacingMs = Math.max(250, Number(options.minSpacingMs) || GRAPH_SAMPLE_MIN_SPACING_MS);
+  const last = items[items.length - 1] || null;
+
+  if (last && now - last.at < minSpacingMs) {
+    last.value = roundedValue;
+    last.at = now;
+    return pruneTimedSeries(items, options.retentionMs);
+  }
+
+  items.push({ value: roundedValue, at: now });
+  return pruneTimedSeries(items, options.retentionMs);
 }
 
 function proxyType(proxy) {
@@ -972,9 +1093,15 @@ export function createMihomoBackend(initialConfig) {
         const score = Math.max(1, Number(inventoryNode?.score || previousNode?.score || scoreFromDelay(delay, alive)));
         const trend =
           Array.isArray(inventoryNode?.trend) && inventoryNode.trend.length
-            ? inventoryNode.trend.map((item) => Math.max(0, Number(item) || 0))
+            ? normalizeTimedSeries(inventoryNode.trend, {
+                fallbackSpacingMs: NODE_TREND_FALLBACK_SPACING_MS,
+                roundDigits: 0,
+              }).slice(-18)
             : Array.isArray(previousNode?.trend) && previousNode.trend.length
-              ? previousNode.trend.map((item) => Math.max(0, Number(item) || 0))
+              ? normalizeTimedSeries(previousNode.trend, {
+                  fallbackSpacingMs: NODE_TREND_FALLBACK_SPACING_MS,
+                  roundDigits: 0,
+                }).slice(-18)
             : delayTrend(proxy.history || providerProxy?.history, latency);
         return {
           id: name,
@@ -1012,7 +1139,10 @@ export function createMihomoBackend(initialConfig) {
         const latency = Math.max(0, Number(node?.latency) || 0);
         const trend =
           Array.isArray(node?.trend) && node.trend.length
-            ? node.trend.map((item) => Math.max(0, Number(item) || 0))
+            ? normalizeTimedSeries(node.trend, {
+                fallbackSpacingMs: NODE_TREND_FALLBACK_SPACING_MS,
+                roundDigits: 0,
+              }).slice(-18)
             : delayTrend([], latency);
         return {
           id: safeString(node?.id, label),
@@ -1287,14 +1417,35 @@ export function createMihomoBackend(initialConfig) {
   }
 
   function updateGraphs(downMbps, upMbps, avgLatency, blockedHits) {
-    state.graphs.throughputDown.push(Math.round(downMbps * 100) / 100);
-    state.graphs.throughputUp.push(Math.round(upMbps * 100) / 100);
-    state.graphs.latencyAverage.push(avgLatency || 0);
-    state.graphs.blockedHits.push(blockedHits || 0);
-    state.graphs.throughputDown = state.graphs.throughputDown.slice(-24);
-    state.graphs.throughputUp = state.graphs.throughputUp.slice(-24);
-    state.graphs.latencyAverage = state.graphs.latencyAverage.slice(-24);
-    state.graphs.blockedHits = state.graphs.blockedHits.slice(-24);
+    const sampleAt = Date.now();
+    state.graphs.throughputDown = appendTimedValue(state.graphs.throughputDown, downMbps, {
+      at: sampleAt,
+      minSpacingMs: GRAPH_SAMPLE_MIN_SPACING_MS,
+      retentionMs: GRAPH_HISTORY_RETENTION_MS,
+      fallbackSpacingMs: GRAPH_FALLBACK_SPACING_MS,
+      roundDigits: 2,
+    });
+    state.graphs.throughputUp = appendTimedValue(state.graphs.throughputUp, upMbps, {
+      at: sampleAt,
+      minSpacingMs: GRAPH_SAMPLE_MIN_SPACING_MS,
+      retentionMs: GRAPH_HISTORY_RETENTION_MS,
+      fallbackSpacingMs: GRAPH_FALLBACK_SPACING_MS,
+      roundDigits: 2,
+    });
+    state.graphs.latencyAverage = appendTimedValue(state.graphs.latencyAverage, avgLatency || 0, {
+      at: sampleAt,
+      minSpacingMs: GRAPH_SAMPLE_MIN_SPACING_MS,
+      retentionMs: GRAPH_HISTORY_RETENTION_MS,
+      fallbackSpacingMs: GRAPH_FALLBACK_SPACING_MS,
+      roundDigits: 0,
+    });
+    state.graphs.blockedHits = appendTimedValue(state.graphs.blockedHits, blockedHits || 0, {
+      at: sampleAt,
+      minSpacingMs: GRAPH_SAMPLE_MIN_SPACING_MS,
+      retentionMs: GRAPH_HISTORY_RETENTION_MS,
+      fallbackSpacingMs: GRAPH_FALLBACK_SPACING_MS,
+      roundDigits: 0,
+    });
   }
 
   function applyTrafficSample(sample) {

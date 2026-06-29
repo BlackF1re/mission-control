@@ -18,6 +18,14 @@ function Write-Utf8NoBom {
     [System.IO.File]::WriteAllText($Path, $Content, $encoding)
 }
 
+function Normalize-LineEndingsLf {
+    param(
+        [Parameter(Mandatory = $true)][string]$Content
+    )
+
+    return $Content.Replace("`r`n", "`n").Replace("`r", "`n")
+}
+
 function Get-Sha256 {
     param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -87,6 +95,7 @@ foreach ($file in $uiFiles) {
     }
     $targetPath = Join-Path $uiStage $file
     $content = Get-Content -Raw -Encoding UTF8 -Path $sourcePath
+    $content = Normalize-LineEndingsLf -Content $content
     $content = $content.Replace("__MISSION_CONTROL_VERSION__", $Version)
     Write-Utf8NoBom -Path $targetPath -Content $content
 }
@@ -103,9 +112,13 @@ $uiZipPath = Join-Path $DistRoot "mission-control-ui.zip"
 Compress-Archive -Path (Join-Path $uiStage "*") -DestinationPath $uiZipPath -Force
 
 $bridgeAssetPath = Join-Path $DistRoot "mission-control-bridge.cgi"
-Copy-Item -Force $bridgeSource $bridgeAssetPath
+$bridgeContent = Get-Content -Raw -Encoding UTF8 -Path $bridgeSource
+$bridgeContent = Normalize-LineEndingsLf -Content $bridgeContent
+$bridgeContent = [regex]::Replace($bridgeContent, 'MISSION_CONTROL_VERSION="[^"]+"', "MISSION_CONTROL_VERSION=""$Version""", 1)
+Write-Utf8NoBom -Path $bridgeAssetPath -Content $bridgeContent
 
 $installScriptContent = Get-Content -Raw -Encoding UTF8 -Path $releaseTemplate
+$installScriptContent = Normalize-LineEndingsLf -Content $installScriptContent
 $installScriptContent = $installScriptContent.Replace("__REPO_OWNER__", $RepoOwner).Replace("__REPO_NAME__", $RepoName)
 $installScriptPath = Join-Path $DistRoot "install.sh"
 Write-Utf8NoBom -Path $installScriptPath -Content $installScriptContent

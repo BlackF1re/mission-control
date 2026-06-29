@@ -46,7 +46,7 @@ LEGACY_BRIDGE_SCRIPT="$LEGACY_BRIDGE_HOME/mission_control_bridge.cgi"
 CURL_LOCAL_ARGS="--connect-timeout 3 --max-time 12"
 DELAY_URL_DEFAULT="https://chatgpt.com/cdn-cgi/trace"
 SPEED_URL_DEFAULT="https://speed.cloudflare.com/__down?bytes=262144"
-MISSION_CONTROL_VERSION="1.0.0"
+MISSION_CONTROL_VERSION="1.0.1"
 MISSION_CONTROL_REPO_OWNER="BlackF1re"
 MISSION_CONTROL_REPO_NAME="mission-control"
 MISSION_CONTROL_MANIFEST_URL_DEFAULT="https://github.com/$MISSION_CONTROL_REPO_OWNER/$MISSION_CONTROL_REPO_NAME/releases/latest/download/mission-control-manifest.json"
@@ -2159,9 +2159,9 @@ run_mission_control_update_job() {
 
   if [ "$update_applied" -eq 1 ]; then
     mark_release_probe "lastAppliedAt" "$(now_iso)"
-    refresh_panel_state_cache || true
   fi
   scheduler_mark_success "mission-control-update"
+  refresh_panel_state_cache || true
   return 0
 }
 

@@ -89,6 +89,27 @@ function buildSeries(length, seed, variation, floor, ceiling) {
   });
 }
 
+function buildTimedSeries(length, seed, variation, floor, ceiling, spacingMs) {
+  const values = buildSeries(length, seed, variation, floor, ceiling);
+  const stepMs = Math.max(1000, Number(spacingMs) || 2000);
+  const endAt = Date.now();
+  const startAt = endAt - Math.max(0, (values.length - 1) * stepMs);
+  return values.map((value, index) => ({
+    value,
+    at: startAt + index * stepMs,
+  }));
+}
+
+function appendTimedSeriesValue(series, value, limit, roundDigits = 1) {
+  const items = Array.isArray(series) ? series.slice() : [];
+  const precision = 10 ** Math.max(0, roundDigits);
+  items.push({
+    value: Math.round(Number(value || 0) * precision) / precision,
+    at: Date.now(),
+  });
+  return items.slice(-Math.max(1, Number(limit) || 1));
+}
+
 function buildNodes() {
   return [
     {
@@ -107,7 +128,7 @@ function buildNodes() {
       rxMbps: 1.8,
       txMbps: 0.18,
       score: 67,
-      trend: buildSeries(18, 1140, 120, 320, 1800),
+      trend: buildTimedSeries(18, 1140, 120, 320, 1800, 60 * 1000),
     },
     {
       id: "dvpn-tr",
@@ -125,7 +146,7 @@ function buildNodes() {
       rxMbps: 0.42,
       txMbps: 0.05,
       score: 82,
-      trend: buildSeries(18, 690, 80, 220, 1200),
+      trend: buildTimedSeries(18, 690, 80, 220, 1200, 60 * 1000),
     },
     {
       id: "dvpn-fi",
@@ -143,7 +164,7 @@ function buildNodes() {
       rxMbps: 3.2,
       txMbps: 0.31,
       score: 94,
-      trend: buildSeries(18, 520, 65, 180, 860),
+      trend: buildTimedSeries(18, 520, 65, 180, 860, 60 * 1000),
     },
     {
       id: "dvpn-kz",
@@ -161,7 +182,7 @@ function buildNodes() {
       rxMbps: 0.82,
       txMbps: 0.1,
       score: 56,
-      trend: buildSeries(18, 486, 54, 280, 960),
+      trend: buildTimedSeries(18, 486, 54, 280, 960, 60 * 1000),
     },
     {
       id: "dvpn-ru",
@@ -179,7 +200,7 @@ function buildNodes() {
       rxMbps: 0.88,
       txMbps: 0.08,
       score: 50,
-      trend: buildSeries(18, 420, 45, 260, 780),
+      trend: buildTimedSeries(18, 420, 45, 260, 780, 60 * 1000),
     },
     {
       id: "alexey-bing",
@@ -197,7 +218,7 @@ function buildNodes() {
       rxMbps: 0.12,
       txMbps: 0.03,
       score: 64,
-      trend: buildSeries(18, 1240, 135, 420, 1900),
+      trend: buildTimedSeries(18, 1240, 135, 420, 1900, 60 * 1000),
     },
     {
       id: "alexey-ebay",
@@ -215,7 +236,7 @@ function buildNodes() {
       rxMbps: 0.36,
       txMbps: 0.09,
       score: 73,
-      trend: buildSeries(18, 1010, 95, 320, 1650),
+      trend: buildTimedSeries(18, 1010, 95, 320, 1650, 60 * 1000),
     },
     {
       id: "alexey-ms",
@@ -233,7 +254,7 @@ function buildNodes() {
       rxMbps: 0.29,
       txMbps: 0.05,
       score: 71,
-      trend: buildSeries(18, 1085, 120, 340, 1700),
+      trend: buildTimedSeries(18, 1085, 120, 340, 1700, 60 * 1000),
     },
     {
       id: "alexey-yahoo",
@@ -251,7 +272,7 @@ function buildNodes() {
       rxMbps: 0,
       txMbps: 0,
       score: 29,
-      trend: buildSeries(18, 1280, 260, 0, 2100),
+      trend: buildTimedSeries(18, 1280, 260, 0, 2100, 60 * 1000),
     },
   ];
 }
@@ -1344,10 +1365,10 @@ export function createState() {
       unresolvedCount: 1,
     },
     graphs: {
-      throughputDown: buildSeries(24, 2.6, 0.55, 0.2, 8.5),
-      throughputUp: buildSeries(24, 0.12, 0.06, 0.01, 0.8),
-      latencyAverage: buildSeries(24, 780, 130, 420, 1300),
-      blockedHits: buildSeries(24, 17, 4.2, 5, 34),
+      throughputDown: buildTimedSeries(24, 2.6, 0.55, 0.2, 8.5, 2000),
+      throughputUp: buildTimedSeries(24, 0.12, 0.06, 0.01, 0.8, 2000),
+      latencyAverage: buildTimedSeries(24, 780, 130, 420, 1300, 2000),
+      blockedHits: buildTimedSeries(24, 17, 4.2, 5, 34, 2000),
     },
     ruleEngine: {
       bases: buildBases(),
@@ -1728,7 +1749,7 @@ function createGeneratedNodes(subscriptionId, index) {
     rxMbps: item.egressCountry === "BY" ? 0 : item.rxMbps,
     txMbps: item.egressCountry === "BY" ? 0 : item.txMbps,
     score: item.score,
-    trend: buildSeries(18, item.egressCountry === "BY" ? 1120 : item.latency, 120, 0, 1900),
+    trend: buildTimedSeries(18, item.egressCountry === "BY" ? 1120 : item.latency, 120, 0, 1900, 60 * 1000),
   }));
 }
 
@@ -1764,17 +1785,13 @@ export function createMockBackend() {
     state.health.directHitsPerMin = Math.round(clamp(state.health.directHitsPerMin + randomBetween(-10, 12), 52, 220));
     state.health.memoryMiB = Math.round(clamp(state.health.memoryMiB + randomBetween(-0.35, 0.55), 58, 78) * 10) / 10;
 
-    state.graphs.throughputDown.push(state.health.downloadMbps);
-    state.graphs.throughputDown = state.graphs.throughputDown.slice(-24);
-    state.graphs.throughputUp.push(state.health.uploadMbps);
-    state.graphs.throughputUp = state.graphs.throughputUp.slice(-24);
-    state.graphs.blockedHits.push(state.health.blockedHitsPerMin);
-    state.graphs.blockedHits = state.graphs.blockedHits.slice(-24);
+    state.graphs.throughputDown = appendTimedSeriesValue(state.graphs.throughputDown, state.health.downloadMbps, 24, 1);
+    state.graphs.throughputUp = appendTimedSeriesValue(state.graphs.throughputUp, state.health.uploadMbps, 24, 2);
+    state.graphs.blockedHits = appendTimedSeriesValue(state.graphs.blockedHits, state.health.blockedHitsPerMin, 24, 0);
 
     state.nodes.forEach((node) => {
       if (node.baseStatus === "unstable") {
-        node.trend.push(0);
-        node.trend = node.trend.slice(-18);
+        node.trend = appendTimedSeriesValue(node.trend, 0, 18, 0);
         return;
       }
 
@@ -1784,8 +1801,7 @@ export function createMockBackend() {
       node.rxMbps = Math.round(clamp(node.rxMbps + randomBetween(-0.3, 0.45), 0.02, 4.6) * 100) / 100;
       node.txMbps = Math.round(clamp(node.txMbps + randomBetween(-0.03, 0.05), 0.01, 0.8) * 100) / 100;
       node.score = Math.round(clamp(node.score + randomBetween(-2.2, 2.4), 22, 99));
-      node.trend.push(node.latency);
-      node.trend = node.trend.slice(-18);
+      node.trend = appendTimedSeriesValue(node.trend, node.latency, 18, 0);
     });
 
     if (!state.connections.paused) {
@@ -1804,8 +1820,7 @@ export function createMockBackend() {
     const averageLatency = Math.round(
       currentCandidates.reduce((sum, node) => sum + node.latency, 0) / Math.max(1, currentCandidates.length),
     );
-    state.graphs.latencyAverage.push(averageLatency);
-    state.graphs.latencyAverage = state.graphs.latencyAverage.slice(-24);
+    state.graphs.latencyAverage = appendTimedSeriesValue(state.graphs.latencyAverage, averageLatency, 24, 0);
   }
 
   function finishAction(action) {

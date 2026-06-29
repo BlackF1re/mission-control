@@ -2321,11 +2321,50 @@ function recentScaleReferencePoints(points, tickCount = 4) {
   return points;
 }
 
+function chartPointValue(point) {
+  const candidate =
+    point && typeof point === "object"
+      ? point.value ?? point.delay ?? point.Delay ?? point.latency ?? point.y
+      : point;
+  const value = Number(candidate);
+  return Number.isFinite(value) ? Math.max(0, value) : 0;
+}
+
+function chartPointTimestamp(point) {
+  if (!point || typeof point !== "object") {
+    return 0;
+  }
+  const rawAt = point.at ?? point.time ?? point.Time ?? point.timestamp ?? point.ts;
+  if (typeof rawAt === "number" && Number.isFinite(rawAt) && rawAt > 0) {
+    return rawAt;
+  }
+  if (typeof rawAt === "string" && rawAt.trim()) {
+    const parsed = Date.parse(rawAt);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+  }
+  return 0;
+}
+
+function normalizeChartPoints(points) {
+  return (Array.isArray(points) ? points : [])
+    .map((point) => {
+      const value = chartPointValue(point);
+      if (!Number.isFinite(value) || value < 0) {
+        return null;
+      }
+      return {
+        value,
+        at: chartPointTimestamp(point),
+      };
+    })
+    .filter(Boolean);
+}
+
 function buildChartScale(points, tickCount = 4) {
   if (!points.length) {
     return { min: 0, max: 1, ticks: [0, 0.5, 1] };
   }
-  const scalePoints = recentScaleReferencePoints(points, tickCount);
+  const scalePoints = recentScaleReferencePoints(points.map((point) => point.value), tickCount);
   const minPoint = Math.min(...scalePoints);
   const maxPoint = Math.max(...scalePoints);
   const naturalSpan = maxPoint - minPoint;
@@ -2360,7 +2399,19 @@ function normalizePadding(padding) {
   };
 }
 
-function createChartGeometry(points, width, height, padding, tickCount = 4) {
+function createChartGeometry(points, width, height, padding, tickCount = 4, xDomain = null) {
+  const hasTimedPoints = points.some((point) => point.at > 0);
+  const validDomain =
+    hasTimedPoints &&
+    xDomain &&
+    Number.isFinite(xDomain.startAt) &&
+    Number.isFinite(xDomain.endAt) &&
+    xDomain.endAt > xDomain.startAt
+      ? {
+          startAt: Number(xDomain.startAt),
+          endAt: Number(xDomain.endAt),
+        }
+      : null;
   const box = normalizePadding(padding);
   return {
     width,
@@ -2369,10 +2420,16 @@ function createChartGeometry(points, width, height, padding, tickCount = 4) {
     plotWidth: Math.max(1, width - box.left - box.right),
     plotHeight: Math.max(1, height - box.top - box.bottom),
     scale: buildChartScale(points, tickCount),
+    xDomain: validDomain,
   };
 }
 
-function chartX(geometry, index, pointCount) {
+function chartX(geometry, point, index, pointCount) {
+  if (geometry.xDomain && point?.at > 0) {
+    const span = Math.max(1, geometry.xDomain.endAt - geometry.xDomain.startAt);
+    const clamped = Math.min(Math.max(point.at, geometry.xDomain.startAt), geometry.xDomain.endAt);
+    return geometry.padding.left + ((clamped - geometry.xDomain.startAt) * geometry.plotWidth) / span;
+  }
   return geometry.padding.left + (index * geometry.plotWidth) / Math.max(1, pointCount - 1);
 }
 
@@ -2387,8 +2444,8 @@ function sparklinePath(points, geometry) {
   }
   return points
     .map((point, index) => {
-      const x = chartX(geometry, index, points.length);
-      const y = chartY(geometry, point);
+      const x = chartX(geometry, point, index, points.length);
+      const y = chartY(geometry, point.value);
       return `${index === 0 ? "M" : "L"}${x.toFixed(2)} ${y.toFixed(2)}`;
     })
     .join(" ");
@@ -2399,8 +2456,8 @@ function areaPath(points, geometry) {
     return "";
   }
   const line = sparklinePath(points, geometry);
-  const firstX = chartX(geometry, 0, points.length);
-  const lastX = chartX(geometry, points.length - 1, points.length);
+  const firstX = chartX(geometry, points[0], 0, points.length);
+  const lastX = chartX(geometry, points[points.length - 1], points.length - 1, points.length);
   const baseline = geometry.height - geometry.padding.bottom;
   return `${line} L${lastX} ${baseline} L${firstX} ${baseline} Z`;
 }
@@ -2452,9 +2509,11 @@ function renderChartSvg({
   lineClass,
   yFormatter,
   xLabels,
+  xDomain = null,
   compact = false,
 }) {
-  const geometry = createChartGeometry(points, width, height, padding, tickCount);
+  const normalizedPoints = normalizeChartPoints(points);
+  const geometry = createChartGeometry(normalizedPoints, width, height, padding, tickCount, xDomain);
   const axisBottom = geometry.height - geometry.padding.bottom;
   const axisRight = geometry.width - geometry.padding.right;
   const axisLeft = geometry.padding.left;
@@ -2467,7 +2526,8 @@ function renderChartSvg({
       compact,
       areaClass,
       lineClass,
-      points,
+      points: normalizedPoints,
+      xDomain: geometry.xDomain,
     }),
   )}`;
 
@@ -2509,8 +2569,8 @@ function renderChartSvg({
           .join("")}
       </g>
       <g clip-path="url(#${clipId})">
-        <path class="chart-area ${areaClass}" d="${areaPath(points, geometry)}"></path>
-        <path class="chart-line ${lineClass}" d="${sparklinePath(points, geometry)}"></path>
+        <path class="chart-area ${areaClass}" d="${areaPath(normalizedPoints, geometry)}"></path>
+        <path class="chart-line ${lineClass}" d="${sparklinePath(normalizedPoints, geometry)}"></path>
       </g>
     </svg>
   `;
@@ -2663,8 +2723,37 @@ function renderToolStatus(tool, copy, language) {
 }
 
 function pointsForGraphRange(points, graphRangeMinutes) {
-  const visiblePoints = Math.max(2, Math.round((Math.max(1, Number(graphRangeMinutes) || 1) / 60) * points.length));
-  return points.slice(-visiblePoints);
+  const items = Array.isArray(points) ? points : [];
+  if (!items.length) {
+    return [];
+  }
+  const timedPoints = items.filter((point) => chartPointTimestamp(point) > 0);
+  if (!timedPoints.length) {
+    const visiblePoints = Math.max(2, Math.round((Math.max(1, Number(graphRangeMinutes) || 1) / 60) * items.length));
+    return items.slice(-visiblePoints);
+  }
+  const latestAt = timedPoints.reduce((max, point) => Math.max(max, chartPointTimestamp(point)), 0);
+  const cutoff = latestAt - Math.max(1, Number(graphRangeMinutes) || 1) * 60 * 1000;
+  const beforeCutoff = timedPoints.filter((point) => chartPointTimestamp(point) < cutoff);
+  const visible = timedPoints.filter((point) => chartPointTimestamp(point) >= cutoff);
+  if (!visible.length) {
+    return timedPoints.slice(-2);
+  }
+  if (beforeCutoff.length) {
+    return [beforeCutoff[beforeCutoff.length - 1], ...visible];
+  }
+  return visible;
+}
+
+function chartTimeDomain(points, graphRangeMinutes) {
+  const latestAt = normalizeChartPoints(points).reduce((max, point) => (point.at > max ? point.at : max), 0);
+  if (!latestAt) {
+    return null;
+  }
+  return {
+    startAt: latestAt - Math.max(1, Number(graphRangeMinutes) || 1) * 60 * 1000,
+    endAt: latestAt,
+  };
 }
 
 function activeServerLabel(snapshot, copy) {
@@ -3060,6 +3149,13 @@ function eventText(event, snapshot, copy) {
 function renderOverviewTrafficContent(snapshot, copy) {
   const throughputDownPoints = pointsForGraphRange(snapshot.graphs.throughputDown, snapshot.settings.graphRange);
   const throughputUpPoints = pointsForGraphRange(snapshot.graphs.throughputUp, snapshot.settings.graphRange);
+  const throughputTimeDomain = chartTimeDomain(
+    [
+      ...(Array.isArray(snapshot.graphs.throughputDown) ? snapshot.graphs.throughputDown : []),
+      ...(Array.isArray(snapshot.graphs.throughputUp) ? snapshot.graphs.throughputUp : []),
+    ],
+    snapshot.settings.graphRange,
+  );
   const speedAxisLabel = (value) => formatThroughput(value, snapshot.settings.language, snapshot.settings);
   const timeLabels = chartTimeLabels(snapshot.settings.graphRange, snapshot.settings.language);
 
@@ -3083,6 +3179,7 @@ function renderOverviewTrafficContent(snapshot, copy) {
           lineClass: "chart-line-download",
           yFormatter: speedAxisLabel,
           xLabels: timeLabels,
+          xDomain: throughputTimeDomain,
         })}
       </div>
       <div class="chart-box chart-box-subtle">
@@ -3097,6 +3194,7 @@ function renderOverviewTrafficContent(snapshot, copy) {
           lineClass: "chart-line-upload",
           yFormatter: speedAxisLabel,
           xLabels: timeLabels,
+          xDomain: throughputTimeDomain,
         })}
       </div>
       <div class="chart-range-panel">
@@ -3153,6 +3251,7 @@ function renderOverviewRouteContent(snapshot, copy) {
 function renderOverviewLatencyContent(snapshot, copy) {
   const activeNode = snapshot.derived.activeProxy || null;
   const latencyPoints = pointsForGraphRange(activeNode?.trend || [], snapshot.settings.graphRange);
+  const latencyTimeDomain = chartTimeDomain(activeNode?.trend || [], snapshot.settings.graphRange);
   const latencyAxisLabel = (value) => `${formatLocalizedNumber(value, snapshot.settings.language, 0, 0)} ms`;
   const timeLabels = chartTimeLabels(snapshot.settings.graphRange, snapshot.settings.language);
   const currentLatency = Math.max(0, Number(activeNode?.latency) || 0);
@@ -3179,6 +3278,7 @@ function renderOverviewLatencyContent(snapshot, copy) {
         lineClass: "chart-line-latency",
         yFormatter: latencyAxisLabel,
         xLabels: timeLabels,
+        xDomain: latencyTimeDomain,
       })}
     </div>
     <p class="muted-note">${copy.sections.latencyNote}</p>
