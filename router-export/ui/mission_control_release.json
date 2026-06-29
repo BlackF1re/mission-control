@@ -1,0 +1,5 @@
+{
+  "version": "__MISSION_CONTROL_VERSION__",
+  "name": "Mission Control",
+  "channel": "stable"
+}

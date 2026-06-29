@@ -1,0 +1,32 @@
+name: Build Mission Control Release Assets
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build-release-assets.yml"
+      - "router-export/**"
+      - "scripts/**"
+      - "README.md"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build release assets
+        shell: pwsh
+        run: ./scripts/build-release.ps1
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: mission-control-release-assets
+          path: dist/*

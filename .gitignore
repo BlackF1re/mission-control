@@ -1,0 +1,7 @@
+openwrt-src/
+sdk/
+public/
+dist/
+dist-build/
+tmp-nikki/
+.agents/

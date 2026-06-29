@@ -1,0 +1,490 @@
+#!/bin/sh
+set -eu
+
+REPO_OWNER="__REPO_OWNER__"
+REPO_NAME="__REPO_NAME__"
+RELEASE_BASE="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/latest/download"
+BRIDGE_URL="${MISSION_CONTROL_BRIDGE_URL:-${RELEASE_BASE}/mission-control-bridge.cgi}"
+UI_URL="${MISSION_CONTROL_UI_URL:-${RELEASE_BASE}/mission-control-ui.zip}"
+MANIFEST_URL="${MISSION_CONTROL_MANIFEST_URL:-${RELEASE_BASE}/mission-control-manifest.json}"
+UI_NAME="${MISSION_CONTROL_UI_NAME:-Mission Control}"
+NIKKI_REPOSITORY_BASE="${MISSION_CONTROL_NIKKI_REPOSITORY:-https://nikkinikki.pages.dev}"
+NIKKI_RELEASE_BASE="${MISSION_CONTROL_NIKKI_RELEASE_BASE:-https://github.com/nikkinikki-org/OpenWrt-nikki/releases/latest/download}"
+BOOTSTRAP_NIKKI="${MISSION_CONTROL_BOOTSTRAP_NIKKI:-1}"
+BRIDGE_HOME="/usr/libexec/mission-control"
+BRIDGE_SCRIPT="${BRIDGE_HOME}/mission_control_bridge.cgi"
+WRAPPER_PATH="/www/cgi-bin/mission-control-bridge"
+TMP_DIR="${TMPDIR:-/tmp}/mission-control-install.$$"
+PKG_MANAGER=""
+PKG_INDEX_UPDATED=0
+NIKKI_FEED_URL=""
+NIKKI_RELEASE_ARCHIVE_URL=""
+NIKKI_BRANCH=""
+NIKKI_ARCH=""
+LEGACY_NIKKI_APK_REPO="https://rage-ac.github.io/Passwall2/packages"
+
+cleanup() {
+  rm -rf "$TMP_DIR"
+}
+
+log() {
+  printf '[mission-control] %s\n' "$1"
+}
+
+fail() {
+  printf '[mission-control] ERROR: %s\n' "$1" >&2
+  exit 1
+}
+
+download_file() {
+  url="$1"
+  destination="$2"
+  if command -v curl >/dev/null 2>&1; then
+    if curl -fsSL --connect-timeout 10 --max-time 180 "$url" -o "$destination"; then
+      return 0
+    fi
+    rm -f "$destination"
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    if wget -O "$destination" "$url"; then
+      return 0
+    fi
+    rm -f "$destination"
+  fi
+  fail "Neither curl nor wget is available for downloads."
+}
+
+try_download_file() {
+  url="$1"
+  destination="$2"
+  if command -v curl >/dev/null 2>&1; then
+    if curl -fsSL --connect-timeout 10 --max-time 180 "$url" -o "$destination"; then
+      return 0
+    fi
+    rm -f "$destination"
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    if wget -O "$destination" "$url"; then
+      return 0
+    fi
+    rm -f "$destination"
+  fi
+  return 1
+}
+
+detect_package_manager() {
+  if command -v apk >/dev/null 2>&1; then
+    PKG_MANAGER="apk"
+    return 0
+  fi
+  if command -v opkg >/dev/null 2>&1; then
+    PKG_MANAGER="opkg"
+    return 0
+  fi
+  fail "Unsupported OpenWrt package manager. Expected apk or opkg."
+}
+
+package_update() {
+  [ "$PKG_INDEX_UPDATED" = "1" ] && return 0
+  case "$PKG_MANAGER" in
+    apk)
+      apk update >/dev/null
+      ;;
+    opkg)
+      opkg update >/dev/null
+      ;;
+  esac
+  PKG_INDEX_UPDATED=1
+}
+
+package_install() {
+  package_update
+  case "$PKG_MANAGER" in
+    apk)
+      apk add "$@" >/dev/null
+      ;;
+    opkg)
+      opkg install "$@" >/dev/null
+      ;;
+  esac
+}
+
+ensure_command() {
+  command_name="$1"
+  shift
+  if command -v "$command_name" >/dev/null 2>&1; then
+    return 0
+  fi
+  [ "$#" -gt 0 ] || fail "Command ${command_name} is missing and no package name was provided."
+  log "Installing dependency: $*"
+  package_install "$@"
+  command -v "$command_name" >/dev/null 2>&1 || fail "Dependency ${command_name} is still unavailable after package install."
+}
+
+ensure_unzip() {
+  if command -v unzip >/dev/null 2>&1; then
+    return 0
+  fi
+  if command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -Fxq 'unzip'; then
+    return 0
+  fi
+  log "Installing dependency: unzip"
+  package_install unzip
+  if command -v unzip >/dev/null 2>&1; then
+    return 0
+  fi
+  if command -v busybox >/dev/null 2>&1 && busybox --list 2>/dev/null | grep -Fxq 'unzip'; then
+    return 0
+  fi
+  fail "unzip is required but unavailable."
+}
+
+nikki_files_ready() {
+  [ -f /etc/config/nikki ] || return 1
+  [ -x /etc/init.d/nikki ] || return 1
+  [ -x /usr/libexec/mihomo ] || return 1
+  [ -d /etc/nikki ] || return 1
+  return 0
+}
+
+detect_nikki_source_urls() {
+  [ -f /etc/openwrt_release ] || fail "/etc/openwrt_release is missing."
+  # shellcheck disable=SC1091
+  . /etc/openwrt_release
+  NIKKI_ARCH="${DISTRIB_ARCH:-}"
+  release="${DISTRIB_RELEASE:-}"
+  [ -n "$NIKKI_ARCH" ] || fail "OpenWrt architecture could not be detected."
+  case "$release" in
+    *24.10*) NIKKI_BRANCH="openwrt-24.10" ;;
+    *25.12*) NIKKI_BRANCH="openwrt-25.12" ;;
+    SNAPSHOT) NIKKI_BRANCH="SNAPSHOT" ;;
+    *)
+      fail "Unsupported OpenWrt release for automatic Nikki bootstrap: ${release:-unknown}"
+      ;;
+  esac
+  NIKKI_FEED_URL="${NIKKI_REPOSITORY_BASE}/${NIKKI_BRANCH}/${NIKKI_ARCH}/nikki"
+  NIKKI_RELEASE_ARCHIVE_URL="${NIKKI_RELEASE_BASE}/nikki_${NIKKI_ARCH}-${NIKKI_BRANCH}.tar.gz"
+}
+
+rewrite_file_without_line() {
+  target_file="$1"
+  target_line="$2"
+  tmp_file="$TMP_DIR/rewrite.$$"
+  if [ -f "$target_file" ]; then
+    grep -Fvx "$target_line" "$target_file" > "$tmp_file" 2>/dev/null || true
+    mv "$tmp_file" "$target_file"
+  fi
+}
+
+configure_nikki_apk_feed() {
+  repo_dir="/etc/apk/repositories.d"
+  repo_file="$repo_dir/customfeeds.list"
+  base_repo_file="/etc/apk/repositories"
+  key_path="/etc/apk/keys/nikki.pem"
+  repo_line="${NIKKI_FEED_URL}/packages.adb"
+  mkdir -p "$repo_dir" /etc/apk/keys
+  log "Configuring official Nikki apk feed: $repo_line"
+  try_download_file "${NIKKI_REPOSITORY_BASE}/public-key.pem" "$key_path" || return 1
+  rewrite_file_without_line "$base_repo_file" "$LEGACY_NIKKI_APK_REPO"
+  rewrite_file_without_line "$repo_file" "$LEGACY_NIKKI_APK_REPO"
+  rewrite_file_without_line "$repo_file" "$repo_line"
+  printf '%s\n' "$repo_line" >> "$repo_file"
+  apk update >/dev/null || return 1
+  PKG_INDEX_UPDATED=1
+  return 0
+}
+
+ensure_nikki_feed() {
+  detect_nikki_source_urls
+  case "$PKG_MANAGER" in
+    apk)
+      configure_nikki_apk_feed
+      ;;
+    opkg)
+      repo_file="/etc/opkg/customfeeds.conf"
+      key_path="$TMP_DIR/nikki.pub"
+      repo_line="src/gz nikki $NIKKI_FEED_URL"
+      log "Configuring official Nikki opkg feed: $repo_line"
+      download_file "${NIKKI_REPOSITORY_BASE}/key-build.pub" "$key_path"
+      opkg-key add "$key_path" >/dev/null 2>&1 || fail "Unable to add Nikki opkg signing key."
+      rewrite_file_without_line "$repo_file" "$repo_line"
+      if [ -f "$repo_file" ]; then
+        grep -Fv 'src/gz nikki ' "$repo_file" > "$TMP_DIR/customfeeds.conf" 2>/dev/null || true
+        mv "$TMP_DIR/customfeeds.conf" "$repo_file"
+      fi
+      printf '%s\n' "$repo_line" >> "$repo_file"
+      opkg update >/dev/null
+      PKG_INDEX_UPDATED=1
+      ;;
+  esac
+}
+
+bootstrap_nikki_stack_from_release_bundle() {
+  bundle_archive="$TMP_DIR/nikki-release.tar.gz"
+  bundle_extract="$TMP_DIR/nikki-release"
+  mkdir -p "$bundle_extract"
+  log "Downloading Nikki release bundle: $NIKKI_RELEASE_ARCHIVE_URL"
+  download_file "$NIKKI_RELEASE_ARCHIVE_URL" "$bundle_archive"
+  tar -xzf "$bundle_archive" -C "$bundle_extract" || fail "Unable to extract Nikki release bundle."
+
+  mihomo_apk=$(find "$bundle_extract" -maxdepth 1 -type f -name 'mihomo-meta-*.apk' | head -n 1)
+  nikki_apk=$(find "$bundle_extract" -maxdepth 1 -type f -name 'nikki-*.apk' | head -n 1)
+  luci_apk=$(find "$bundle_extract" -maxdepth 1 -type f -name 'luci-app-nikki-*.apk' | head -n 1)
+
+  [ -n "$mihomo_apk" ] || fail "Nikki release bundle is missing mihomo-meta."
+  [ -n "$nikki_apk" ] || fail "Nikki release bundle is missing nikki."
+  [ -n "$luci_apk" ] || fail "Nikki release bundle is missing luci-app-nikki."
+
+  apk add --allow-untrusted --force-reinstall \
+    "$mihomo_apk" \
+    "$nikki_apk" \
+    "$luci_apk" >/dev/null || fail "Nikki install from release bundle failed."
+
+  if command -v uci >/dev/null 2>&1; then
+    luci_lang=$(uci -q get luci.main.lang 2>/dev/null || printf '')
+    if [ -n "$luci_lang" ]; then
+      luci_i18n_apk=$(find "$bundle_extract" -maxdepth 1 -type f -name "luci-i18n-nikki-${luci_lang}-*.apk" | head -n 1)
+      if [ -n "$luci_i18n_apk" ]; then
+        apk add --allow-untrusted --force-reinstall "$luci_i18n_apk" >/dev/null || true
+      fi
+    fi
+  fi
+}
+
+bootstrap_nikki_stack() {
+  [ "$BOOTSTRAP_NIKKI" = "1" ] || fail "Nikki is incomplete and automatic bootstrap is disabled."
+  detect_nikki_source_urls
+  log "Installing or repairing Nikki, Mihomo and LuCI integration from the official feed"
+  case "$PKG_MANAGER" in
+    apk)
+      if configure_nikki_apk_feed &&
+        apk add --allow-untrusted --force-reinstall -X "${NIKKI_FEED_URL}/packages.adb" \
+          mihomo-meta nikki luci-app-nikki >/dev/null; then
+        :
+      else
+        log "Official Nikki apk feed is unavailable. Falling back to the official GitHub release bundle."
+        bootstrap_nikki_stack_from_release_bundle
+      fi
+      ;;
+    opkg)
+      opkg install mihomo-meta nikki luci-app-nikki >/dev/null || fail "Official Nikki opkg install failed."
+      ;;
+  esac
+  nikki_files_ready || fail "Nikki bootstrap finished, but required Nikki files are still missing."
+}
+
+ensure_nikki_ready() {
+  nikki_files_ready && return 0
+  log "Nikki is missing or incomplete. Bootstrapping the official Nikki stack first."
+  bootstrap_nikki_stack
+}
+
+extract_archive_root() {
+  extracted_dir="$1"
+  if [ -f "$extracted_dir/index.html" ]; then
+    printf '%s\n' "$extracted_dir"
+    return 0
+  fi
+  index_path=$(find "$extracted_dir" -mindepth 1 -maxdepth 2 -type f -name 'index.html' | head -n 1)
+  [ -n "$index_path" ] || return 1
+  dirname "$index_path"
+}
+
+write_wrapper() {
+  cat > "$WRAPPER_PATH" <<'EOF'
+#!/bin/sh
+exec /usr/libexec/mission-control/mission_control_bridge.cgi "$@"
+EOF
+  chmod 0755 "$WRAPPER_PATH"
+}
+
+write_ui_entrypoint_redirect() {
+  ui_root="/etc/nikki/run/ui"
+  [ -d "$ui_root" ] || return 0
+  ui_entry_path=$(printf '%s' "$UI_NAME" | sed 's/ /%20/g')
+  [ -n "$ui_entry_path" ] || return 0
+  if [ ! -d "$ui_root/$UI_NAME" ] && [ ! -f "$ui_root/$UI_NAME/index.html" ]; then
+    return 0
+  fi
+  cat > "$ui_root/index.html" <<EOF
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="refresh" content="0; url=./${ui_entry_path}/" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>${UI_NAME}</title>
+  </head>
+  <body>
+    <script>location.replace('./${ui_entry_path}/');</script>
+    <a href="./${ui_entry_path}/">Open ${UI_NAME}</a>
+  </body>
+</html>
+EOF
+}
+
+install_ui_assets() {
+  ui_root="/etc/nikki/run/ui"
+  ui_archive="$TMP_DIR/mission-control-ui.zip"
+  ui_extract="$TMP_DIR/ui-extract"
+  mkdir -p "$ui_root" "$ui_extract"
+  log "Downloading Mission Control UI"
+  download_file "$UI_URL" "$ui_archive"
+  case 1 in
+    1)
+      if command -v unzip >/dev/null 2>&1; then
+        unzip -oq "$ui_archive" -d "$ui_extract" >/dev/null
+      else
+        busybox unzip -oq "$ui_archive" -d "$ui_extract" >/dev/null
+      fi
+      ;;
+  esac
+  archive_root="$(extract_archive_root "$ui_extract")" || fail "UI archive does not contain index.html."
+  cp -R "$archive_root"/. "$ui_root"/
+  if [ -d "$ui_root/$UI_NAME" ]; then
+    rm -rf "$ui_root/$UI_NAME"
+  fi
+}
+
+write_bootstrap_profile() {
+  profile_dir="/etc/nikki/profiles"
+  mkdir -p "$profile_dir"
+  cat > "$profile_dir/mission-control-bootstrap.yaml" <<'EOF'
+proxies: []
+proxy-groups: []
+rules:
+  - MATCH,DIRECT
+EOF
+}
+
+subscription_profile_exists() {
+  profile_ref="$1"
+  case "$profile_ref" in
+    subscription:*)
+      section_name="${profile_ref#subscription:}"
+      [ -n "$section_name" ] || return 1
+      [ -s "/etc/nikki/subscriptions/${section_name}.yaml" ]
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+file_profile_exists() {
+  profile_ref="$1"
+  case "$profile_ref" in
+    file:*)
+      profile_name="${profile_ref#file:}"
+      [ -n "$profile_name" ] || return 1
+      [ -s "/etc/nikki/profiles/$profile_name" ]
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+ensure_bootstrap_runtime() {
+  write_bootstrap_profile
+
+  current_enabled="$(uci -q get nikki.config.enabled 2>/dev/null || printf '0')"
+  current_profile="$(uci -q get nikki.config.profile 2>/dev/null || printf '')"
+  profile_ok=0
+
+  if subscription_profile_exists "$current_profile" || file_profile_exists "$current_profile"; then
+    profile_ok=1
+  fi
+
+  if [ "$current_enabled" != "1" ] || [ "$profile_ok" != "1" ]; then
+    log "Priming Nikki with the Mission Control bootstrap profile"
+    uci set nikki.config.enabled='1'
+    uci set nikki.config.profile='file:mission-control-bootstrap.yaml'
+    uci set nikki.proxy.router_proxy='0'
+    uci set nikki.proxy.lan_proxy='0'
+    uci commit nikki
+  fi
+}
+
+wait_for_ui_assets() {
+  ui_root="/etc/nikki/run/ui"
+  attempts=30
+  while [ "$attempts" -gt 0 ]; do
+    if [ -f "$ui_root/mission_control_bootstrap.js" ] || [ -f "$ui_root/index.html" ] || [ -d "$ui_root/$UI_NAME" ]; then
+      return 0
+    fi
+    sleep 1
+    attempts=$((attempts - 1))
+  done
+  return 1
+}
+
+configure_nikki_ui() {
+  uci set nikki.mixin.ui_path='ui'
+  uci set nikki.mixin.ui_name="$UI_NAME"
+  uci set nikki.mixin.ui_url="$UI_URL"
+  uci commit nikki
+}
+
+prime_bridge_state() {
+  REQUEST_METHOD=GET PATH_INFO=/mission-control/state "$BRIDGE_SCRIPT" >/dev/null 2>&1 || true
+}
+
+seed_manifest_url() {
+  model_path="/etc/nikki/panel/model.json"
+  tmp_model="$TMP_DIR/mission-control-model.json"
+  [ -f "$model_path" ] || return 0
+  MANIFEST_URL="$MANIFEST_URL" yq -p json -o=json '
+    .settings.automation.manifestUrl = strenv(MANIFEST_URL)
+  ' "$model_path" > "$tmp_model"
+  cp "$tmp_model" "$model_path"
+}
+
+restart_services() {
+  if [ -x /etc/init.d/cron ]; then
+    /etc/init.d/cron restart >/dev/null 2>&1 || true
+  fi
+  if [ -x /etc/init.d/nikki ]; then
+    /etc/init.d/nikki restart >/dev/null 2>&1 || true
+  fi
+}
+
+main() {
+  mkdir -p "$TMP_DIR"
+  trap cleanup EXIT INT TERM
+
+  detect_package_manager
+  ensure_nikki_ready
+
+  command -v uci >/dev/null 2>&1 || fail "uci is required."
+
+  ensure_command curl curl ca-bundle
+  ensure_command yq yq
+  ensure_unzip
+
+  mkdir -p "$BRIDGE_HOME" "$(dirname "$WRAPPER_PATH")"
+  log "Downloading Mission Control bridge"
+  download_file "$BRIDGE_URL" "$TMP_DIR/mission-control-bridge.cgi"
+  sh -n "$TMP_DIR/mission-control-bridge.cgi" || fail "Downloaded bridge script is invalid."
+  cp "$TMP_DIR/mission-control-bridge.cgi" "$BRIDGE_SCRIPT"
+  chmod 0755 "$BRIDGE_SCRIPT"
+  write_wrapper
+
+  log "Configuring Nikki external UI"
+  configure_nikki_ui
+  ensure_bootstrap_runtime
+
+  prime_bridge_state
+  seed_manifest_url
+
+  restart_services
+  wait_for_ui_assets || true
+  install_ui_assets
+  write_ui_entrypoint_redirect
+
+  log "Installed. Nikki will fetch the UI archive from: $UI_URL"
+  log "Bridge endpoint: $WRAPPER_PATH"
+  log "Router-side release manifest: $MANIFEST_URL"
+}
+
+main "$@"
